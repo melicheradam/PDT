@@ -1,5 +1,5 @@
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 import gzip
 from orjson import orjson
 import psycopg2
@@ -7,6 +7,8 @@ from psycopg2.extras import execute_values
 
 
 class Uploader:
+
+    templates = None
 
     def __init__(self):
         self.conn = psycopg2.connect(
@@ -17,9 +19,10 @@ class Uploader:
             database=os.environ["DB_DATABASE"],
         )
         self.cursor = self.conn.cursor()
-        self.bt = datetime.now()
+        self.bt = datetime.now(timezone.utc)
         self.et = None
-        self.last_time = datetime.now()
+        self.output = open("output.csv", "a+")
+        self.last_time = datetime.now(timezone.utc)
         self.buff: dict[str, list] = {
             "authors": [],
             "conversations": [],
@@ -32,39 +35,36 @@ class Uploader:
             "links": [],
             "conversation_references": [],
         }
-        self.templates: dict[str, str] = {
-            "authors": "(id, name, username, description, followers_count, following_count, tweet_count, listed_count)",
-            "conversations": "(id, author_id, content, possibly_sensitive, language, source, retweet_count, reply_count, like_count, quote_count, created_at)",
-            "hashtags": "(tag)",
-            "conversation_hashtags": "(conversation_id, hashtag_id)",
-            "context_domains": "(id, name, description)",
-            "context_entities": "(id, name, description)",
-            "context_annotations": "(conversation_id, context_domain_id, context_entity_id)",
-            "annotations": "(conversation_id, value, type, probability)",
-            "links": "(conversation_id, url, title, description)",
-            "conversation_references": "(conversation_id, parent_id, type)",
-        }
 
     def upload(self, *args):
         raise NotImplementedError
 
     def close(self):
-        self.et = datetime.now()
+        self.output.close()
+        self.et = datetime.now(timezone.utc)
         print("Total time elapsed: {}".format(self.et - self.bt))
 
-    def _do_upload(self, table_name, force=False):
-        if len(self.buff[table_name]) % 10000 == 0 or force:
-            print("{},{},{}".format(
-                datetime.now().isoformat(),
-                datetime.now() - self.bt,
-                datetime.now() - self.last_time))
-            self.last_time = datetime.now()
-            execute_values(self.cursor, "INSERT INTO {}{} VALUES %s ON CONFLICT DO NOTHING".format(table_name, self.templates[table_name]), self.buff[table_name])
+    def _do_upload(self, table_name, force=False, log=False):
+        if len(self.buff[table_name]) % 50000 == 0 or force:
+            if log:
+                utc_now = datetime.now(timezone.utc)
+                block_min, block_s = divmod((utc_now - self.last_time).seconds, 60)
+                total_min, total_s = divmod((utc_now - self.bt).seconds, 60)
+                print("{}Z,{:02d}:{:02d},{:02d}:{:02d}".format(
+                    utc_now.isoformat(timespec="seconds"),
+                    total_min, total_s,
+                    block_min, block_s
+                    ), file=self.output)
+                self.last_time = utc_now
+            execute_values(self.cursor, "INSERT INTO {}{} VALUES %s ON CONFLICT DO NOTHING".format(table_name, self.templates[table_name]), self.buff[table_name], page_size=10000)
             self.conn.commit()
             self.buff[table_name] = []
 
 
 class AuthorsUploader(Uploader):
+    templates: dict[str, str] = {
+        "authors": "(id, name, username, description, followers_count, following_count, tweet_count, listed_count)",
+    }
 
     def upload(self, json_data: dict):
         self.buff["authors"].append((
@@ -72,25 +72,39 @@ class AuthorsUploader(Uploader):
             json_data["public_metrics"]["followers_count"], json_data["public_metrics"]["following_count"],
             json_data["public_metrics"]["tweet_count"], json_data["public_metrics"]["listed_count"]
         ))
-        self._do_upload("authors")
+        self._do_upload("authors", log=True)
 
     def close(self):
         if len(self.buff["authors"]) > 0:
-            self._do_upload("authors", force=True)
+            self._do_upload("authors", force=True, log=True)
         super().close()
 
 
 class ConversationsUploader(Uploader):
+    templates: dict[str, str] = {
+        "authors": "(id)",
+        "conversations": "(id, author_id, content, possibly_sensitive, language, source, retweet_count, reply_count, like_count, quote_count, created_at)",
+        "hashtags": "(tag)",
+        "conversation_hashtags": "(conversation_id, hashtag_id)",
+        "context_domains": "(id, name, description)",
+        "context_entities": "(id, name, description)",
+        "context_annotations": "(conversation_id, context_domain_id, context_entity_id)",
+        "annotations": "(conversation_id, value, type, probability)",
+        "links": "(conversation_id, url, title, description)",
+        "conversation_references": "(conversation_id, parent_id, type)",
+    }
 
     def upload(self, json_data: dict):
-        self.buff["authors"].append((
+        public_metrics = json_data.get("public_metrics", {})
+        self.buff["conversations"].append((
             json_data["id"], json_data["author_id"], json_data["text"], json_data["possibly_sensitive"],
-            json_data["lang"], json_data["source"], json_data["public_metrics"]["retweet_count"],
-            json_data["public_metrics"]["reply_count"], json_data["public_metrics"]["like_count"],
-            json_data["public_metrics"]["quote_count"], json_data["created_at"]
+            json_data["lang"], json_data["source"], public_metrics.get("retweet_count"),
+            public_metrics.get("reply_count"),  public_metrics.get("like_count"),
+            public_metrics.get("quote_count"), json_data["created_at"]
         ))
 
-        self._do_upload("conversations")
+        self._do_upload("conversations", log=True)
+        self.__upload_authors(json_data)
         self.__upload_hashtags(json_data)
         self.__upload_context_annotations(json_data)
         self.__upload_annotations(json_data)
@@ -99,21 +113,25 @@ class ConversationsUploader(Uploader):
 
     def __upload_hashtags(self, json_data: dict):
         # annotations
-        for item in json_data["entities"].get("hashtags", []):
-            self.cursor.execute("""SELECT id FROM hashtags WHERE tag=%s""", [item["tag"]])
+        try:
+            for item in json_data["entities"].get("hashtags", []):
+                self.cursor.execute("""SELECT id FROM hashtags WHERE tag=%s""", [item["tag"]])
 
-            tag_id = self.cursor.fetchone()[0]
+                tag_id = self.cursor.fetchone()
 
-            if tag_id is None:
-                self.cursor.execute("""INSERT INTO hashtags(tag) VALUES (%s) RETURNING ID""", [item["tag"]])
+                if tag_id is None:
+                    self.cursor.execute("""INSERT INTO hashtags(tag) VALUES (%s) RETURNING ID""", [item["tag"]])
+                    tag_id = self.cursor.fetchone()[0]
+                else:
+                    tag_id = tag_id[0]
 
-            tag_id = self.cursor.fetchone()[0]
+                self.buff["conversation_hashtags"].append((
+                    json_data["id"], tag_id
+                ))
 
-            self.buff["conversation_hashtags"].append((
-                json_data["id"], tag_id
-            ))
-
-            self._do_upload("conversation_hashtags")
+                self._do_upload("conversation_hashtags")
+        except KeyError:
+            pass
 
     def __upload_context_annotations(self, json_data: dict):
         # annotations
@@ -122,30 +140,44 @@ class ConversationsUploader(Uploader):
                 json_data["id"], item["domain"]["id"], item["entity"]["id"]
             ))
             self.buff["context_domains"].append((
-                item["domain"]["id"], item["domain"]["name"], item["domain"]["description"]
+                item["domain"]["id"], item["domain"]["name"], item["domain"].get("description", None)
             ))
             self.buff["context_entities"].append((
-                item["entity"]["id"], item["entity"]["name"], item["entity"]["description"]
+                item["entity"]["id"], item["entity"]["name"], item["entity"].get("description", None)
             ))
             self._do_upload("context_annotations")
             self._do_upload("context_domains")
             self._do_upload("context_entities")
 
+    def __upload_authors(self, json_data):
+        self.buff["authors"].append((
+            json_data["author_id"],
+        ))
+        self._do_upload("authors")
+
     def __upload_annotations(self, json_data: dict):
         # annotations
-        for item in json_data["entities"].get("annotations", []):
-            self.buff["annotations"].append((
-                json_data["id"], item["normalized_text"], item["type"], item["probability"]
-            ))
-            self._do_upload("annotations")
+        try:
+            for item in json_data["entities"].get("annotations", []):
+                self.buff["annotations"].append((
+                    json_data["id"], item["normalized_text"], item["type"], item["probability"]
+                ))
+                self._do_upload("annotations")
+        except KeyError:
+            pass
 
     def __upload_links(self, json_data: dict):
         # links
-        for item in json_data["entities"].get("urls", []):
-            self.buff["links"].append((
-                json_data["id"], item["expanded_url"], item["title"], item["description"]
-            ))
-            self._do_upload("links")
+        try:
+            for item in json_data["entities"].get("urls", []):
+                if len(item["expanded_url"]) > 2048:
+                    continue
+                self.buff["links"].append((
+                    json_data["id"], item["expanded_url"], item.get("title", None), item.get("description")
+                ))
+                self._do_upload("links")
+        except KeyError:
+            pass
 
     def __upload_references(self, json_data: dict):
         # conversation_references
@@ -156,7 +188,7 @@ class ConversationsUploader(Uploader):
         self._do_upload("conversation_references")
 
     def close(self):
-        self._do_upload("conversations", force=True)
+        self._do_upload("conversations", force=True, log=True)
         self._do_upload("links", force=True)
         self._do_upload("annotations", force=True)
         self._do_upload("context_annotations", force=True)
@@ -168,21 +200,19 @@ class ConversationsUploader(Uploader):
 
 
 def main():
-    """
+
     uploader = AuthorsUploader()
     with gzip.open("D:\\Downloads\\authors.jsonl.gz", 'rt') as f:
         for line in f:
             json_data = orjson.loads(line.replace("\\u0000", ""))  # need to replace this because postgres wont accept \x00 cahracter
             uploader.upload(json_data)
     uploader.close()
-    """
+
     uploader = ConversationsUploader()
     with gzip.open("D:\\Downloads\\conversations.jsonl.gz", 'rt') as f:
         for line in f:
             json_data = orjson.loads(line.replace("\\u0000", ""))  # need to replace this because postgres wont accept \x00 cahracter
             uploader.upload(json_data)
-            print(json_data)
-            break
     uploader.close()
 
 
